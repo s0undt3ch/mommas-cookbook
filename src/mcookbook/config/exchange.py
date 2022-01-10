@@ -9,7 +9,6 @@ from typing import Optional
 import ccxt.async_support
 from pydantic import BaseModel
 from pydantic import Field
-from pydantic import PrivateAttr
 from pydantic import SecretStr
 from pydantic import validator
 
@@ -37,8 +36,6 @@ class ExchangeConfig(BaseModel):
     pair_allow_list: list[str] = Field(default_factory=list)
     pair_block_list: list[str] = Field(default_factory=list)
 
-    _cctx = PrivateAttr()
-
     @validator("name")
     @classmethod
     def _validate_exchange_name(cls, value: str) -> str:
@@ -50,7 +47,8 @@ class ExchangeConfig(BaseModel):
         if value not in ccxt_exchanges:
             raise ValueError(f"The exchange {value!r} is not supported by CCXT.")
         supported_exchanges: list[str] = [
-            ex._name for ex in Exchange.__subclasses__()  # pylint: disable=protected-access
+            ex.__exchange_name__
+            for ex in Exchange.__subclasses__()  # pylint: disable=protected-access
         ]
         if value not in supported_exchanges:
             raise ValueError(

@@ -132,7 +132,6 @@ class TemporaryLoggingHandler(logging.NullHandler):
     """
 
     def __init__(self, level: int = logging.NOTSET, max_queue_size: int = 10000) -> None:
-        self.__max_queue_size: int = max_queue_size
         super().__init__(level=level)
         self.__messages: Deque[logging.LogRecord] = deque(maxlen=max_queue_size)
 
