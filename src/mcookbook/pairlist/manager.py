@@ -1,42 +1,70 @@
 """
 Pair list manager.
 """
+# pylint: disable=no-member,not-an-iterable,unsubscriptable-object
 from __future__ import annotations
 
 import logging
 from typing import Any
 from typing import TYPE_CHECKING
 
+import attrs
 from cachetools import cached
 from cachetools import TTLCache
 from ccxt.async_support import Exchange as CCXTExchange
-from pydantic import BaseModel
-from pydantic import PrivateAttr
 
-from mcookbook.utils import expand_pairlist
+from mcookbook.events import Events
+from mcookbook.utils.pairlist import expand_pairlist
 
 if TYPE_CHECKING:
-    from mcookbook.config.live import LiveConfig
-    from mcookbook.exchanges.abc import Exchange
-    from mcookbook.pairlist import PairList
+    from mcookbook.config.base import BaseConfig
+    from mcookbook.pairlist.abc import PairList  # noqa: E402e
+    from mcookbook.exchanges.abc import Exchange  # noqa: E402e
+
 
 log = logging.getLogger(__name__)
 
 
-class PairListManager(BaseModel):
+@attrs.define(kw_only=True)
+class PairListManager:
     """
     Pair list manager.
     """
 
-    _allow_list: list[str] = PrivateAttr(default_factory=list)
-    _block_list: list[str] = PrivateAttr(default_factory=list)
-    _pairlist_handlers: list[PairList] = PrivateAttr(default_factory=list)
-    _tickers_needed: bool = PrivateAttr(default=False)
-    _exchange: Exchange = PrivateAttr()
-    config: LiveConfig
+    config: BaseConfig = attrs.field()
+    events: Events = attrs.field()
+    ccxt_conn: CCXTExchange = attrs.field()
+    exchange: Exchange = attrs.field()
 
-    def __init__(self, config: LiveConfig) -> None:
-        super().__init__(config=config)
+    _allow_list: list[str] = attrs.field(factory=list)
+    _block_list: list[str] = attrs.field(factory=list)
+    _pairlist_handlers: list[PairList] = attrs.field(factory=list)
+    _tickers_needed: bool = attrs.field(default=False)
+
+    def __attrs_post_init__(self) -> None:
+        """
+        Post attrs, initialization routines.
+        """
+        self.events.on_start.register(self._populate_internal_config)
+        self.events.on_markets_available.register(self._on_markets_available)
+
+    async def _on_markets_available(
+        self, *, markets: dict[str, Any]  # pylint: disable=unused-argument
+    ) -> None:
+        await self.refresh_pairlist()
+
+    async def _populate_internal_config(self) -> None:
+
+        for handler_config in self.config.pairlists:
+            self._pairlist_handlers.append(
+                handler_config.init_handler(
+                    name=handler_config.name,
+                    config=handler_config,
+                    exchange=self.exchange,
+                    ccxt_conn=self.ccxt_conn,
+                    pairlist_manager=self,
+                )
+            )
         for pair in self.config.exchange.pair_allow_list:
             self._allow_list.append(pair)
         for pair in self.config.exchange.pair_block_list:
@@ -45,29 +73,23 @@ class PairListManager(BaseModel):
             self._tickers_needed |= handler.needstickers
 
     @property
-    def exchange(self) -> CCXTExchange:
-        """
-        Return the CCTX exchange instance.
-        """
-        return self._exchange.api
-
-    @property
     def expanded_blacklist(self) -> list[str]:
         """
         The expanded blacklist (including wildcard expansion).
         """
-        return expand_pairlist(self._block_list, list(self._exchange.markets))
+        return expand_pairlist(self._block_list, list(self.exchange.markets))
 
     @cached(TTLCache(maxsize=1, ttl=1800))
     async def _get_cached_tickers(self) -> dict[str, Any]:
         log.info("Fetching tickers for exchange %s", self.config.exchange.name)
-        tickers: dict[str, Any] = await self.exchange.get_tickers()
+        tickers: dict[str, Any] = await self.ccxt_conn.get_tickers()
         return tickers
 
     async def refresh_pairlist(self) -> None:
         """
         Run pairlist through all configured Pairlist Handlers.
         """
+        log.info("Refreshing pairlist...")
         # Tickers should be cached to avoid calling the exchange on each call.
         tickers: dict[str, Any] = {}
         if self._tickers_needed:
@@ -116,7 +138,7 @@ class PairListManager(BaseModel):
         """
         try:
 
-            whitelist = expand_pairlist(pairlist, list(self._exchange.markets), keep_invalid)
+            whitelist = expand_pairlist(pairlist, list(self.exchange.markets), keep_invalid)
         except ValueError as err:
             log.error("Pair whitelist contains an invalid Wildcard: %s", err)
             return []

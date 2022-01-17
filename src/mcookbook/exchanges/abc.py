@@ -1,102 +1,87 @@
 """
 Base exchange class implementation.
 """
+# pylint: disable=no-member,not-an-iterable,unsubscriptable-object
 from __future__ import annotations
 
+import abc
 import logging
-import pprint
 from typing import Any
+from typing import TYPE_CHECKING
 
-import ccxt
-from ccxt.async_support import Exchange as CCXTExchange
-from pydantic import BaseModel
-from pydantic import PrivateAttr
+import attrs
 
-from mcookbook.config.live import LiveConfig
+from mcookbook.config.trade import TradeConfig
+from mcookbook.events import Events
 from mcookbook.exceptions import OperationalException
-from mcookbook.pairlist.manager import PairListManager
-from mcookbook.utils import merge_dictionaries
+from mcookbook.utils.ccxt import CCXTExchange
 
 log = logging.getLogger(__name__)
 
 
-class Exchange(BaseModel):
+if TYPE_CHECKING:
+    from mcookbook.config.base import BaseConfig
+
+
+@attrs.define(kw_only=True, auto_attribs=False)
+class Exchange(abc.ABC):
     """
     Base Exchange class.
     """
 
-    _name: str = PrivateAttr()
-    _market: str = PrivateAttr()
+    __exchange_name__: str
+    __exchange_market__: str
 
-    config: LiveConfig
+    config: TradeConfig = attrs.field()
+    events: Events = attrs.field()
+    ccxt_conn: CCXTExchange = attrs.field()
 
-    _api: type[CCXTExchange] = PrivateAttr()
-    _markets: dict[str, dict[str, Any]] = PrivateAttr(default_factory=dict)
-    _pairlist_manager: PairListManager = PrivateAttr()
+    _markets: dict[str, dict[str, Any]] = attrs.field(init=False, repr=False, factory=dict)
 
-    def _get_ccxt_headers(self) -> dict[str, str] | None:
-        return None
+    def __attrs_post_init__(self) -> None:
+        """
+        Post attrs, initialization routines.
+        """
+        self.events.on_start.register(self._on_start)
 
-    def _get_ccxt_config(self) -> dict[str, Any] | None:
-        return None
+    async def _on_start(self) -> None:
+        await self.get_markets()
+
+    @staticmethod
+    def get_ccxt_headers() -> dict[str, str]:
+        """
+        Return exchange specific HTTP headers dictionary.
+
+        Return a dictionary with extra HTTP headers to pass to ccxt when creating the
+        connection instance.
+        """
+        return {}
+
+    @staticmethod
+    def get_ccxt_config() -> dict[str, Any]:
+        """
+        Return exchange specific configuration dictionary.
+
+        Return a dictionary with extra options to pass to ccxt when creating the
+        connection instance.
+        """
+        return {}
 
     @classmethod
-    def resolved(cls, config: LiveConfig) -> Exchange:
+    def resolve_class(cls, config: BaseConfig) -> type[Exchange]:
         """
-        Resolve the passed ``name`` and ``market`` to class implementation.
+        Resolve the exchange class to use based on the configuration.
         """
         name = config.exchange.name
         market = config.exchange.market
         for subclass in cls.__subclasses__():
-            subclass_name = subclass._name  # pylint: disable=protected-access
-            subclass_market = subclass._market  # pylint: disable=protected-access
+            subclass_name = subclass.__exchange_name__
+            subclass_market = subclass.__exchange_market__
             if subclass_name == name and market == subclass_market:
-                instance = subclass.parse_obj({"config": config.dict()})
-                instance._pairlist_manager = PairListManager.construct(config=config)
-                instance._pairlist_manager._exchange = instance
-                for handler in config.pairlists:
-                    handler._exchange = instance
-                instance._pairlist_manager._pairlist_handlers = config.pairlists
-                return instance
+                return subclass
         raise OperationalException(
-            f"Cloud not find an implementation for the {name}(market={market}) exchange."
+            f"Could not properly resolve the exchange class based on exchange name {name!r} and market {market!r}."
         )
-
-    @property
-    def api(self) -> CCXTExchange:
-        """
-        Instantiate and return a CCXT exchange class.
-        """
-        try:
-            return self._api
-        except AttributeError:
-            log.info("Using CCXT %s", ccxt.__version__)
-            ccxt_config = self.config.exchange.get_ccxt_config()
-            exchange_ccxt_config = self._get_ccxt_config()  # pylint: disable=assignment-from-none
-            if exchange_ccxt_config:
-                merge_dictionaries(ccxt_config, exchange_ccxt_config)
-            headers = self._get_ccxt_headers()  # pylint: disable=assignment-from-none
-            if headers:
-                merge_dictionaries(ccxt_config, {"headers": headers})
-            log.info(
-                "Instantiating API for the '%s' exchange with the following configuration:\n%s",
-                self.config.exchange.name,
-                pprint.pformat(ccxt_config),
-            )
-            # Reveal secrets
-            for key in ("apiKey", "secret", "password", "uid"):
-                if key not in ccxt_config:
-                    continue
-                ccxt_config[key] = ccxt_config[key].get_secret_value()
-            try:
-                self._api = getattr(ccxt.async_support, self.config.exchange.name)(ccxt_config)
-            except (KeyError, AttributeError) as exc:
-                raise OperationalException(
-                    f"Exchange {self.config.exchange.name} is not supported"
-                ) from exc
-            except ccxt.BaseError as exc:
-                raise OperationalException(f"Initialization of ccxt failed. Reason: {exc}") from exc
-        return self._api
 
     async def get_markets(self) -> dict[str, Any]:
         """
@@ -104,7 +89,8 @@ class Exchange(BaseModel):
         """
         if not self._markets:
             log.info("Loading markets")
-            self._markets = await self.api.load_markets()
+            self._markets = await self.ccxt_conn.load_markets()
+            await self.events.on_markets_available.emit(markets=self._markets)
         return self._markets
 
     @property
@@ -113,10 +99,3 @@ class Exchange(BaseModel):
         Return the loaded markets.
         """
         return self._markets
-
-    @property
-    def pairlist_manager(self) -> PairListManager:
-        """
-        Return the pair list manager.
-        """
-        return self._pairlist_manager

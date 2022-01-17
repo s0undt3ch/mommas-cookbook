@@ -2,6 +2,7 @@ api
 arg
 async
 attr
+attrs
 binance
 btc
 ccxt
@@ -29,6 +30,7 @@ subclasses
 timeframe
 tradable
 ttl
+un
 virtualenv
 virtualenvs
 wildcardpl
